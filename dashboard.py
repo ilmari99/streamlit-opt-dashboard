@@ -10,6 +10,8 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import numpy as np
 import time
+import math
+import textwrap
 
 # Page configuration
 st.set_page_config(
@@ -20,6 +22,28 @@ st.set_page_config(
 
 st.title("🧩 Optimization Process Dashboard")
 st.write(f"Current Working Directory: {os.getcwd()}")
+
+# Lightweight password gate using .streamlit/secrets.toml
+def check_password():
+    secret = st.secrets.get("password")
+    if not secret:
+        st.error("Password not set in .streamlit/secrets.toml")
+        return False
+
+    if st.session_state.get("auth_ok"):
+        return True
+
+    pwd = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if pwd == secret:
+            st.session_state.auth_ok = True
+        else:
+            st.error("Incorrect password")
+    return st.session_state.get("auth_ok", False)
+
+
+if not check_password():
+    st.stop()
 
 # Function to load data
 @st.cache_data(ttl=5) # Cache for 5s
@@ -83,22 +107,8 @@ def load_data(experiment_dir):
             # Features
             features = meta.get('feature_vector', [])
             
-            # Additional Metrics Extraction
-            # Check metadata first
+            # Additional metadata
             m_data = meta.get('metadata', {})
-            # Check score breakdown runtime profile
-            profile = meta.get('score', {}).get('breakdown', {}).get('runtime_profile', {})
-            
-            # Helper to get value from either source
-            def get_val(key, default=None):
-                val = profile.get(key)
-                if val is None:
-                    val = m_data.get(key)
-                return val if val is not None else default
-
-            wall_time = get_val('wall_time_s', 0.0)
-            rss = get_val('max_rss_kb', 0.0)
-            instructions = get_val('instructions', 0.0)
             
             nodes_data.append({
                 'id': node_id,
@@ -115,9 +125,7 @@ def load_data(experiment_dir):
                     or m_data.get('llm_thinking_blocks')
                     or 'No summary'
                 ),
-                'wall_time': wall_time,
-                'max_rss_kb': rss,
-                'instructions': instructions
+                'metadata': m_data,
             })
                     
         except Exception as e:
@@ -159,6 +167,63 @@ def load_data(experiment_dir):
         G.add_edges_from(edges)
         
     return df, G
+
+def _cosine_distance(a, b) -> float:
+    if not a or not b or len(a) != len(b):
+        return 1.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 1.0
+    sim = max(-1.0, min(1.0, dot / (norm_a * norm_b)))
+    return 1.0 - sim
+
+def compute_novelty(df: pd.DataFrame, frontier_novelty_weight: float = 0.5) -> pd.Series:
+    if df.empty or 'features' not in df.columns:
+        return pd.Series([], dtype=float)
+
+    nodes_with_vec = df[df['features'].apply(lambda x: isinstance(x, list) and len(x) > 0)].copy()
+    if nodes_with_vec.empty:
+        return pd.Series([0.0] * len(df), index=df.index, dtype=float)
+
+    history_data = list(zip(nodes_with_vec['id'].tolist(), nodes_with_vec['features'].tolist()))
+    frontier_data = history_data
+    k_neighbors = min(len(history_data), 5)
+    k_frontier = min(len(frontier_data) - 1, 5)
+
+    novelty_map = {}
+    for node_id, vec in history_data:
+        novelty_history = 0.0
+        if vec and history_data:
+            dists = []
+            for h_id, h_vec in history_data:
+                if h_id == node_id:
+                    continue
+                dists.append(_cosine_distance(vec, h_vec))
+            if dists:
+                dists.sort()
+                nearest = dists[:k_neighbors]
+                novelty_history = sum(nearest) / len(nearest)
+
+        novelty_frontier = 0.0
+        if vec and len(frontier_data) > 1:
+            dists = []
+            for f_id, f_vec in frontier_data:
+                if f_id == node_id:
+                    continue
+                dists.append(_cosine_distance(vec, f_vec))
+            if dists:
+                dists.sort()
+                nearest = dists[:k_frontier]
+                novelty_frontier = sum(nearest) / len(nearest)
+
+        w = frontier_novelty_weight
+        novelty = (1.0 - w) * novelty_history + w * novelty_frontier
+        novelty_map[node_id] = novelty
+
+    novelty_series = df['id'].map(novelty_map).fillna(0.0)
+    return novelty_series
 
 def get_tree_layout(G):
     if len(G) == 0:
@@ -264,6 +329,11 @@ if selected_experiment:
     # Load Data
     # with st.spinner(f"Loading data from {exp_path.resolve()}..."):
     df, G = load_data(str(exp_path.resolve()))
+    if not df.empty:
+        df['novelty'] = compute_novelty(df)
+        df['Code Summary'] = df['code_summary'].fillna('').apply(
+            lambda s: "<br>".join(textwrap.wrap(str(s), width=80)) if str(s) else ""
+        )
     
     st.write(f"Loaded {len(df)} nodes.")
     
@@ -298,8 +368,8 @@ if selected_experiment:
     
     # Color control
     color_metric = st.sidebar.selectbox(
-        "Color Nodes By", 
-        ["Status", "Score", "Wall Time", "Instructions", "Memory"]
+        "Color Nodes By",
+        ["Status", "Score"]
     )
     
     col_graph, col_lb = st.columns([2, 1])
@@ -340,9 +410,6 @@ if selected_experiment:
             # Helper to map metric to value
             metric_map = {
                 "Score": "score",
-                "Wall Time": "wall_time",
-                "Instructions": "instructions",
-                "Memory": "max_rss_kb"
             }
             
             val_list = []
@@ -370,10 +437,9 @@ if selected_experiment:
                     score_fmt = n.get('score', 0)
                     
                     node_text.append(
-                        f"ID: {n['id'][:8]}...<br>" + 
-                        f"Score: {score_fmt:.4f}<br>" + 
-                        f"Status: {status_lbl}<br>" +
-                        f"Time: {n.get('wall_time',0):.4f}s"
+                        f"ID: {n['id'][:8]}...<br>"
+                        f"Score: {score_fmt:.4f}<br>"
+                        f"Status: {status_lbl}"
                     )
                     
                     if color_metric == "Status":
@@ -432,7 +498,7 @@ if selected_experiment:
         lb_df = df.copy()
         
         # Reorder columns: score, status, metrics, id
-        cols = ['score', 'status', 'wall_time', 'instructions', 'max_rss_kb', 'id']
+        cols = ['score', 'status', 'id']
         lb_cols = [c for c in cols if c in lb_df.columns]
         
         st.dataframe(
@@ -441,9 +507,6 @@ if selected_experiment:
             height=500,
             column_config={
                 "score": st.column_config.NumberColumn("Score", format="%.4f"),
-                "wall_time": st.column_config.NumberColumn("Time (s)", format="%.4f"),
-                "instructions": st.column_config.NumberColumn("Instr.", format="%.2e"),
-                "max_rss_kb": st.column_config.NumberColumn("Mem (KB)"),
                 "id": st.column_config.TextColumn("ID", width="small"),
             },
             hide_index=True 
@@ -497,8 +560,12 @@ if selected_experiment:
                     title = f"PCA of {len(features_matrix[0])} Features"
                 else: # t-SNE
                     n_samples = len(features_matrix)
-                    # Perplexity must be less than n_samples
-                    perp = min(30, max(5, int(n_samples / 4))) 
+                    # Perplexity must be > 1 and < n_samples
+                    if n_samples <= 2:
+                        st.info("Not enough samples for t-SNE (need at least 3).")
+                        st.stop()
+                    max_perp = max(2, n_samples - 1)
+                    perp = min(30, max_perp)
                     tsne = TSNE(n_components=2, perplexity=perp, random_state=42, init='random', learning_rate='auto')
                     comps = tsne.fit_transform(features_matrix)
                     title = f"t-SNE (perp={perp})"
@@ -514,7 +581,13 @@ if selected_experiment:
                     feat_df, x='C1', y='C2',
                     color=metric_map[color_metric] if color_metric != "Status" else 'status',
                     size='plot_size',
-                    hover_data=['id', 'score', 'wall_time', 'instructions'],
+                    hover_data={
+                        'id': True,
+                        'score': True,
+                        'Code Summary': True,
+                        'C1': False,
+                        'C2': False,
+                    },
                     color_discrete_map={'Correct': 'green', 'Incorrect': 'red', 'UNKNOWN': 'gray'} if color_metric == "Status" else None,
                     color_continuous_scale='RdYlGn' if color_metric == "Score" else ('RdYlGn_r' if color_metric != "Status" else None),
                     title=title
@@ -532,7 +605,30 @@ if selected_experiment:
                                 title="Histogram of Scores")
         st.plotly_chart(fig_hist, use_container_width=True)
 
+    st.divider()
+    st.subheader("Novelty by Node ID")
+    if 'novelty' in df.columns and not df.empty:
+        novelty_df = df.sort_values('novelty', ascending=False).copy()
+        novelty_df['id_str'] = novelty_df['id'].astype(str)
+        fig_novelty = px.bar(
+            novelty_df,
+            x='id_str',
+            y='novelty',
+            color='status',
+            color_discrete_map={'Correct': 'green', 'Incorrect': 'red', 'UNKNOWN': 'gray'},
+            hover_data=['score', 'Code Summary'],
+            title="Novelty by Node ID"
+        )
+        fig_novelty.update_xaxes(
+            type='category',
+            categoryorder='array',
+            categoryarray=novelty_df['id_str'].tolist()
+        )
+        st.plotly_chart(fig_novelty, use_container_width=True)
+    else:
+        st.info("No novelty data available.")
+
     # Auto-refresh logic (placed at the end to ensure rendering completes)
     if st.sidebar.checkbox("Auto Refresh", value=True):
-        time.sleep(2)
+        time.sleep(30)
         st.rerun()
